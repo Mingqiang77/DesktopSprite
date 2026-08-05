@@ -33,7 +33,8 @@ git init
 ## 3. 处理目录归属（safe.directory）问题
 
 在 Windows 上若目录属主与当前 Git 用户不一致，Git 会报
-`detected dubious ownership in repository` 并拒绝执行命令。此时有两种处理方式：
+`detected dubious ownership in repository` 并拒绝执行命令（完整原因与处理记录见
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md)）。此时有两种处理方式：
 
 方式一：写入全局配置（需要对应权限）：
 
@@ -50,6 +51,12 @@ $env:GIT_CONFIG_VALUE_0 = 'D:/iKun/iKun/DesktopSprite'
 ```
 
 > 说明：后续 Git 命令都需在该环境变量设置后执行。
+
+方式三（永久修复，后续已执行）：把目录加入全局白名单：
+
+```powershell
+git config --global --add safe.directory D:/iKun/iKun/DesktopSprite
+```
 
 ## 4. 关联远程仓库
 

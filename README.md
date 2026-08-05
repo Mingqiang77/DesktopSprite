@@ -16,3 +16,7 @@ python -m venv .venv
 
 仓库初始化及远程关联的全部命令见 [COMMANDS.md](COMMANDS.md)。
 
+## 故障排查
+
+`git add .` 报 "dubious ownership" 的原因和处理记录见
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
