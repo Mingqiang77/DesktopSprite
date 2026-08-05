@@ -81,7 +81,7 @@ file:C:/Users/mingqiang.zhang/.gitconfig	D:/iKun/iKun/DesktopSprite
 
 结论：报错已解决，`git add .` 恢复正常，无需再设置任何环境变量。
 
-## 5. 适用场景提醒
+## 5. 适用场景提醒-1
 
 - 该报错仅在“仓库目录属主 ≠ 当前 Git 用户”时出现。
 - 如果平时以 `Mingqiang.Zhang` 身份直接操作本仓库（属主相同），不会触发该错误。
