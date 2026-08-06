@@ -1,6 +1,6 @@
 # iKun Desktop Sprite
 
-Windows 桌面悬浮宠物 —— iKun 桌面精灵,一起守护我们最好的KunKun。基于 PyQt5 + pynput 实现，支持全局键盘联动、自动状态轮换、气泡提示与系统托盘。
+电脑桌面 —— iKun精灵,一起守护我们最好的KunKun。基于 PyQt5 + pynput 实现，支持全局键盘联动、自动状态轮换、气泡提示与系统托盘。
 
 ---
 
