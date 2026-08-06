@@ -1,0 +1,45 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-macos:
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build app with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm --windowed --onefile \
+            --name desktop_pet \
+            --add-data "images:images" \
+            desktop_pet.py
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg_root
+          cp -R dist/desktop_pet.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create \
+            -volname "DesktopSprite" \
+            -srcfolder dmg_root \
+            -ov -format UDZO \
+            dist/desktop_pet.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop_pet-macos-dmg
+          path: dist/desktop_pet.dmg

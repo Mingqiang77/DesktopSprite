@@ -28,6 +28,9 @@ PET_SIZE = 240             # 宠物绘制区域大小
 ANIMATION_FPS = 30         # 动画帧率
 STATE_INTERVAL = 4000      # 状态自动切换间隔（毫秒）
 BLINK_INTERVAL = 3000      # 眨眼间隔（毫秒）
+BUBBLE_TEXTS = ["唱🎤", "跳💃", "Rap🎶打🏀"]  # 气泡文案固定轮播顺序
+BUBBLE_POKE_TEXT = "你干嘛~"   # 仅鼠标点击（被戳）时显示
+BUBBLE_INTERVAL = 2000     # 气泡文案切换间隔（毫秒）
 
 def _find_image_path():
     """多路径查找 ikun.jpg，兼容 .py 和 .exe 运行方式"""
@@ -105,6 +108,12 @@ class DesktopPet(QWidget):
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._trigger_blink)
         self._blink_timer.start(BLINK_INTERVAL)
+
+        # ---- 气泡文案轮播 ----
+        self._bubble_index = 0
+        self._bubble_timer = QTimer(self)
+        self._bubble_timer.timeout.connect(self._next_bubble_text)
+        self._bubble_timer.start(BUBBLE_INTERVAL)
 
         # ---- 被戳恢复 ----
         self._poke_timer = QTimer(self)
@@ -270,6 +279,11 @@ class DesktopPet(QWidget):
             self._bounce_y = int(-2 * math.sin(t * 2))
             self._shake_x = 0
 
+        self.update()
+
+    def _next_bubble_text(self):
+        """按固定顺序切换到下一条气泡文案，循环展示"""
+        self._bubble_index = (self._bubble_index + 1) % len(BUBBLE_TEXTS)
         self.update()
 
     # ========================================================
@@ -635,16 +649,12 @@ class DesktopPet(QWidget):
         painter.drawPath(arc2)
 
     def _draw_state_bubble_absolute(self, painter: QPainter):
-        """在窗口绝对坐标系中绘制状态文字气泡，确保不被裁切"""
-        texts = {
-            PetState.IDLE: "唱🎤",
-            PetState.HAPPY: "跳💃",
-            PetState.SLEEPY: "Rap🎶打🏀",
-            PetState.POKE: "你干嘛~",
-        }
-        text = texts.get(self.state, "")
-        if not text:
-            return
+        """在窗口绝对坐标系中绘制气泡文案，按固定顺序每隔两秒切换下一条"""
+        if self.state == PetState.POKE:
+            # 被戳时固定显示点击文案
+            text = BUBBLE_POKE_TEXT
+        else:
+            text = BUBBLE_TEXTS[self._bubble_index]
 
         painter.setPen(QPen(QColor(80, 80, 80), 1))
         painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
