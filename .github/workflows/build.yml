@@ -1,0 +1,106 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  # ---------------------------------------------------------------
+  # 单元测试：offscreen 无窗口模式运行，不弹窗、不挂钩真实键盘
+  # ---------------------------------------------------------------
+  test:
+    name: Tests (headless)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  # ---------------------------------------------------------------
+  # Windows 单文件 exe
+  # ---------------------------------------------------------------
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Build exe with PyInstaller
+        run: pyinstaller desktop_pet.spec --clean --noconfirm
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iKun-windows-exe
+          path: dist/iKun.exe
+
+  # ---------------------------------------------------------------
+  # macOS .app + .dmg
+  # ---------------------------------------------------------------
+  build-macos:
+    needs: test
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Build app with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm --windowed --onefile \
+            --name iKun \
+            --add-data "images:images" \
+            --hidden-import pynput.keyboard._darwin \
+            --hidden-import pynput.mouse._darwin \
+            desktop_pet.py
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg_root
+          cp -R dist/iKun.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create \
+            -volname "iKun Desktop Sprite" \
+            -srcfolder dmg_root \
+            -ov -format UDZO \
+            dist/iKun.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iKun-macos-dmg
+          path: dist/iKun.dmg
