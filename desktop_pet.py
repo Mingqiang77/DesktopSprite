@@ -11,15 +11,16 @@ import random
 import math
 import time
 from enum import Enum, auto
-from collections import deque
 
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QMenu, QAction, QSystemTrayIcon, QDesktopWidget
+    QApplication, QWidget, QMenu, QAction, QSystemTrayIcon
 )
-from PyQt5.QtCore import Qt, QTimer, QPoint, QRectF
+from PyQt5.QtCore import (
+    Qt, QTimer, QPoint, QPointF, QRect, QRectF, pyqtSignal
+)
 from PyQt5.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QFontMetrics,
-    QPixmap, QImage, QIcon, QPainterPath
+    QPixmap, QImage, QIcon, QPainterPath, QGuiApplication, QRegion
 )
 
 try:
@@ -33,13 +34,27 @@ except ImportError:
 # ============================================================
 WINDOW_SIZE = 220          # 窗口大小（预留顶部空间给状态气泡）
 PET_SIZE = 150             # 宠物绘制区域大小
-ANIMATION_FPS = 30         # 动画帧率
+ANIMATION_FPS = 30         # 活跃状态帧率（开心 / 被戳 / 打字）
+IDLE_FPS = 12              # 发呆 / 困倦 时的低帧率，显著降低空转 CPU
 STATE_INTERVAL_MIN = 10000 # 状态自动切换最小间隔（毫秒）
 STATE_INTERVAL_MAX = 20000 # 状态自动切换最大间隔（毫秒）
 BLINK_INTERVAL = 3000      # 眨眼间隔（毫秒）
-TYPING_TIMEOUT = 2000      # 停止打字超过2秒后恢复发呆（毫秒）
-TYPING_FATIGUE_TIME = 1000# 连续打字超过30秒触发疲劳（毫秒）
-BUBBLE_SHOW_DURATION = 3000# 气泡显示时长（毫秒）
+BLINK_DURATION = 200       # 单次眨眼时长（毫秒）
+TYPING_TIMEOUT = 2000      # 停止打字超过 2 秒后恢复发呆（毫秒）
+TYPING_FATIGUE_TIME = 30000  # 连续打字每满 30 秒触发一次疲劳提示（毫秒）
+POKE_RECOVER_TIME = 1500   # 被戳状态持续时间（毫秒）
+STRETCH_DURATION = 2000    # 伸懒腰动画时长（毫秒）
+BUBBLE_SHOW_DURATION = 3000  # 气泡显示时长（毫秒）
+CLICK_THRESHOLD = 5.0      # 判定"单击"的最大移动距离（像素，欧氏距离）
+MAX_BORDER_TRIM = 8        # 最多裁掉多少像素的"同色边框带"（源图顶部灰边等）
+
+# ---- Windows 点击穿透相关常量 ----
+PYWIN = sys.platform == "win32"
+WM_NCHITTEST = 0x0084      # 命中测试消息
+HTTRANSPARENT = -1         # 让系统把鼠标事件交给下层窗口
+if PYWIN:
+    import ctypes
+    from ctypes import wintypes
 
 # 疲劳提示文案，固定顺序轮播
 BUBBLE_TEXTS = ["唱🎤", "跳💃", "Rap🎶", "打🏀"]
@@ -48,19 +63,54 @@ BUBBLE_POKE_TEXT = "你干嘛~"
 
 
 def _find_image_path():
-    """多路径查找 ikun.jpg，兼容 .py 脚本和 PyInstaller 打包后的运行方式。"""
+    """
+    多路径查找 ikun.jpg，兼容源码运行与 PyInstaller 打包后的运行方式。
+    不再包含任何开发机绝对路径：分发给别人时不会误加载无关图片。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        r"D:\iKun\iKun\DesktopSprite\images\ikun.jpg",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "ikun.jpg"),
-        os.path.join(getattr(sys, '_MEIPASS', ""), "images", "ikun.jpg"),
+        os.path.join(getattr(sys, "_MEIPASS", ""), "images", "ikun.jpg"),
+        os.path.join(here, "images", "ikun.jpg"),
         os.path.join(os.path.dirname(sys.executable), "images", "ikun.jpg"),
         os.path.join(os.getcwd(), "images", "ikun.jpg"),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "images", "ikun.jpg"),
+        os.path.join(os.path.dirname(here), "images", "ikun.jpg"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
             return path
     return None
+
+
+def _screen_available_geometry(anchor=None):
+    """返回锚点所在屏幕（默认主屏）的可用区域，已扣除任务栏，支持多显示器。"""
+    screen = None
+    if anchor is not None:
+        screen = QGuiApplication.screenAt(anchor)
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    return screen.availableGeometry()
+
+
+def _hide_own_console():
+    """
+    隐藏黑框，但只在本进程拥有该控制台时动手。
+    原实现无条件调用 GetConsoleWindow()+ShowWindow，若用户是在 cmd/PowerShell
+    里敲 python desktop_pet.py 启动的，会把用户自己的终端窗口一起隐藏掉。
+    """
+    if not PYWIN:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
+            return
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == kernel32.GetCurrentProcessId():
+            user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -78,6 +128,9 @@ class PetState(Enum):
 # 桌面宠物主窗口
 # ============================================================
 class DesktopPet(QWidget):
+    # 跨线程信号：pynput 监听线程只负责"报信"，所有 UI 状态一律回到主线程处理
+    _key_event = pyqtSignal()
+
     def __init__(self):
         super().__init__()
 
@@ -93,13 +146,8 @@ class DesktopPet(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)     # 禁用系统背景绘制
         self.setFixedSize(WINDOW_SIZE, WINDOW_SIZE)
 
-        # 启动默认位置：屏幕右下角（预留任务栏空间）
-        screen = QDesktopWidget().screenGeometry()
-        self.move(
-            screen.width() - WINDOW_SIZE - 10,
-            screen.height() - WINDOW_SIZE - 40
-        )
-        self._default_pos = self.pos()
+        # 启动默认位置：主屏可用区域（已扣任务栏）右下角
+        self.move(self._default_position())
 
         # ---- 拖拽相关（严格区分拖拽和点击）----
         self._dragging = False
@@ -114,9 +162,11 @@ class DesktopPet(QWidget):
 
         # ---- 动画帧 ----
         self._frame = 0
+        self._fps = IDLE_FPS           # 当前帧率，随状态切换
+        self._anim_time = 0.0          # 动画时间轴（秒），与帧率解耦
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._update_animation)
-        self._anim_timer.start(1000 // ANIMATION_FPS)
+        self._anim_timer.start(1000 // self._fps)
 
         # ---- 眨眼 ----
         self._blinking = False
@@ -152,19 +202,18 @@ class DesktopPet(QWidget):
         # ---- 图片资源 ----
         self._image_mode = False
         self._pixmap = None
+        self._pet_region = QRegion()   # 宠物非透明区域（逻辑像素，未含动画偏移）
         self._load_image()
+
+        # ---- 右键菜单（只构建一次，避免每次右键累积 QMenu 子对象）----
+        self._context_menu = self._build_context_menu()
 
         # ---- 系统托盘 ----
         self._setup_tray()
 
         # ---- 其他动画参数 ----
-        self._hidden = False
         self._bounce_y = 0          # 弹跳偏移
         self._shake_x = 0           # 抖动/摇晃偏移
-        self._mouth_open = 0        # 嘴巴张开程度 (0~1)
-        self._eye_openness = 1.0    # 眼睛睁开程度 (0~1)
-        self._cheek_blush = 0       # 腮红强度
-        self._tear_drop = 0         # 眼泪动画
         self._head_tilt = 0         # 头部倾斜角度
         self._arm_offset = 0        # 手臂敲击偏移
         self._stretch_y = 0         # 伸懒腰纵向拉伸比例
@@ -172,8 +221,9 @@ class DesktopPet(QWidget):
         self.setWindowTitle("iKun桌面精灵")
         self.show()
 
-        # ---- 启动键盘监听（独立线程，不阻塞 UI）----
+        # ---- 启动键盘监听：先把跨线程信号接好，再启动线程 ----
         self._keyboard_listener = None
+        self._key_event.connect(self._on_key_pressed)
         self._start_keyboard_listener()
 
     # ========================================================
@@ -188,26 +238,20 @@ class DesktopPet(QWidget):
     # 键盘监听
     # ========================================================
     def _start_keyboard_listener(self):
-        """在独立线程启动 pynput 全局键盘监听。"""
+        """在独立线程启动 pynput 全局键盘监听（线程内不做任何 UI 操作）。"""
         if not PYNPUT_AVAILABLE:
             print("警告：未安装 pynput，键盘联动功能不可用。请执行: pip install pynput")
             return
 
         def on_press(key):
             """
-            按键回调（运行于子线程）。
-            仅记录时间戳，UI 状态切换通过 QTimer.singleShot 交由主线程处理。
+            按键回调（运行于 pynput 子线程）。
+            只记录时间戳并 emit 跨线程信号；真正的状态切换由主线程的
+            _on_key_pressed 完成。原实现直接调 QTimer.singleShot 是错的
+            —— Qt 定时器依赖调用线程的事件循环，子线程没有事件循环，回调会静默失效。
             """
-            current_time = int(time.time() * 1000)
-            self._last_key_time = current_time
-            if not self._typing:
-                self._typing = True
-                self._typing_start_time = current_time
-                QTimer.singleShot(0, self._on_typing_start)
-            else:
-                typing_duration = current_time - self._typing_start_time
-                if typing_duration >= TYPING_FATIGUE_TIME:
-                    QTimer.singleShot(0, self._on_typing_fatigue)
+            self._last_key_time = int(time.time() * 1000)
+            self._key_event.emit()
 
         try:
             self._keyboard_listener = keyboard.Listener(on_press=on_press)
@@ -216,19 +260,38 @@ class DesktopPet(QWidget):
         except Exception as e:
             print(f"键盘监听启动失败：{e}（部分环境需要管理员权限）")
 
+    def _on_key_pressed(self):
+        """
+        主线程处理一次按键（由 _key_event 信号排队投递）：
+        - 本轮首个按键：进入 TYPING 状态；
+        - 连续打字每满 TYPING_FATIGUE_TIME（30 秒）触发一次疲劳提示，
+          并把起算点推向当前时刻，实现"每 30 秒一次"而不是"每个按键一次"。
+        """
+        now = int(time.time() * 1000)
+        self._last_key_time = now
+        if not self._typing:
+            self._typing = True
+            self._typing_start_time = now
+            self._on_typing_start()
+            return
+        if now - self._typing_start_time >= TYPING_FATIGUE_TIME:
+            self._typing_start_time = now
+            self._on_typing_fatigue()
+
     def _on_typing_start(self):
-        """用户开始打字，切换为打字状态。"""
+        """用户开始打字，切换为打字状态（被戳动画优先级更高，播完自动接回）。"""
         if self.state != PetState.POKE:
             self._set_state(PetState.TYPING)
 
     def _on_typing_fatigue(self):
-        """连续打字超过 30 秒，触发疲劳提示（伸懒腰 + 轮播气泡）。"""
-        if self.state == PetState.TYPING and not self._stretching:
-            self._stretching = True
-            text = BUBBLE_TEXTS[self._bubble_index % len(BUBBLE_TEXTS)]
-            self._bubble_index += 1
-            self._show_bubble(text)
-            QTimer.singleShot(2000, self._end_stretch)
+        """连续打字满一个周期：伸懒腰 + 轮播一条气泡文案。"""
+        if self.state != PetState.TYPING or self._stretching:
+            return
+        self._stretching = True
+        text = BUBBLE_TEXTS[self._bubble_index % len(BUBBLE_TEXTS)]
+        self._bubble_index += 1
+        self._show_bubble(text)
+        QTimer.singleShot(STRETCH_DURATION, self._end_stretch)
 
     def _end_stretch(self):
         """结束伸懒腰动画。"""
@@ -253,60 +316,146 @@ class DesktopPet(QWidget):
     # ========================================================
     def _load_image(self):
         """
-        加载外部图片，去除边缘连通的白色背景（保留主体内部白色如眼睛等），
-        失败则使用默认纯色方块占位，确保程序不崩溃。
+        加载外部图片，去除与边缘连通的白色背景（保留主体内部白色如眼睛等），
+        失败则回退到矢量绘制，确保程序不崩溃。
+
+        去底改为直接操作 QImage 的原始像素缓冲区（扫描线洪水填充）：
+        原实现每像素调 pixelColor/setPixelColor，一两万像素就要几十万次跨语言
+        调用，启动时会明显卡顿。
         """
+        dpr = max(1.0, self.devicePixelRatioF())
+        image = None
         path = _find_image_path()
         if path:
-            img = QImage(path)
-            if not img.isNull():
-                # 先等比缩放至目标尺寸
-                pixmap = QPixmap.fromImage(img)
-                scaled = pixmap.scaled(
-                    PET_SIZE, PET_SIZE,
+            raw = QImage(path)
+            if not raw.isNull():
+                raw = self._trim_border_bands(raw)
+                # 按设备像素缩放到目标尺寸，高分屏下不会发虚
+                target = int(round(PET_SIZE * dpr))
+                image = raw.scaled(
+                    target, target,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation
-                )
-                image = scaled.toImage().convertToFormat(QImage.Format_ARGB32)
-                w, h = image.width(), image.height()
-                transparent = QColor(0, 0, 0, 0)
+                ).convertToFormat(QImage.Format_ARGB32)
+                image.setDevicePixelRatio(1.0)   # 统一按设备像素计算，最后再挂 DPR
 
-                def is_bg_white(x, y):
-                    c = image.pixelColor(x, y)
-                    return c.red() > 240 and c.green() > 240 and c.blue() > 240
+        if image is not None and not image.isNull():
+            self._flood_fill_background(image)
+            self._pixmap = QPixmap.fromImage(image)
+            self._pixmap.setDevicePixelRatio(dpr)
+            self._image_mode = True
+            self._pet_region = self._build_pet_region(image)
+            return
 
-                visited = [[False] * h for _ in range(w)]
-                queue = deque()
-
-                # 从四条边寻找背景白色起点
-                for x in range(w):
-                    for y in (0, h - 1):
-                        if is_bg_white(x, y) and not visited[x][y]:
-                            queue.append((x, y))
-                            visited[x][y] = True
-                for y in range(h):
-                    for x in (0, w - 1):
-                        if is_bg_white(x, y) and not visited[x][y]:
-                            queue.append((x, y))
-                            visited[x][y] = True
-
-                # Flood Fill：只将与边缘连通的白色设为背景透明
-                while queue:
-                    x, y = queue.popleft()
-                    image.setPixelColor(x, y, transparent)
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nx, ny = x + dx, y + dy
-                        if 0 <= nx < w and 0 <= ny < h and not visited[nx][ny] and is_bg_white(nx, ny):
-                            visited[nx][ny] = True
-                            queue.append((nx, ny))
-
-                self._pixmap = QPixmap.fromImage(image)
-                self._image_mode = True
-                return
-
-        # 加载失败：纯色方块占位
+        # 加载失败：矢量模式，命中区域取内切圆（比整块方形更贴近实际可见范围）
         self._pixmap = None
         self._image_mode = False
+        self._pet_region = QRegion(QRect(0, 0, PET_SIZE, PET_SIZE), QRegion.Ellipse)
+
+    @staticmethod
+    def _flood_fill_background(image: QImage):
+        """
+        从四条边出发，把与边缘连通的近白色像素置为全透明（原地修改）。
+        直接读写 ARGB32 的原始字节：小端下内存顺序为 B,G,R,A。
+        """
+        w, h = image.width(), image.height()
+        if w <= 0 or h <= 0 or sys.byteorder != "little":
+            return
+        bpl = image.bytesPerLine()
+        try:
+            ptr = image.bits()
+            ptr.setsize(bpl * h)
+            buf = memoryview(ptr).cast("B")
+        except Exception:
+            return   # 拿不到可写缓冲区就放弃去底（仅影响观感，不影响功能）
+
+        visited = bytearray(w * h)
+        stack = []
+
+        def seed(x, y):
+            """把近白色像素加入待扩散栈（同一像素只入栈一次）。"""
+            index = y * w + x
+            if visited[index]:
+                return
+            off = y * bpl + x * 4
+            if buf[off] > 240 and buf[off + 1] > 240 and buf[off + 2] > 240:
+                visited[index] = 1
+                stack.append(index)
+
+        for x in range(w):
+            seed(x, 0)
+            seed(x, h - 1)
+        for y in range(h):
+            seed(0, y)
+            seed(w - 1, y)
+
+        while stack:
+            index = stack.pop()
+            y, x = divmod(index, w)
+            off = y * bpl + x * 4
+            buf[off:off + 4] = b"\x00\x00\x00\x00"
+            if x > 0:
+                seed(x - 1, y)
+            if x < w - 1:
+                seed(x + 1, y)
+            if y > 0:
+                seed(x, y - 1)
+            if y < h - 1:
+                seed(x, y + 1)
+
+    @staticmethod
+    def _same_color(a, b, tolerance: int = 10) -> bool:
+        """判断两个颜色是否近似相同（用于边框带检测）。"""
+        return (abs(a.red() - b.red()) <= tolerance
+                and abs(a.green() - b.green()) <= tolerance
+                and abs(a.blue() - b.blue()) <= tolerance)
+
+    @classmethod
+    def _trim_border_bands(cls, image: QImage, limit: int = MAX_BORDER_TRIM) -> QImage:
+        """
+        裁掉图像四周"整行/整列同色"的窄边框带。
+        ikun.jpg 顶部有 5 像素灰边，缩放后会在宠物头顶留下一条可见灰线，
+        白底也是一圈同色边框。只裁 limit 像素以内，避免把正常画面边距当成边框。
+        """
+        w, h = image.width(), image.height()
+        if w < 3 * limit or h < 3 * limit:
+            return image
+
+        def row_uniform(y):
+            ref = image.pixelColor(0, y)
+            return all(cls._same_color(image.pixelColor(x, y), ref)
+                       for x in range(0, w, 4))
+
+        def col_uniform(x):
+            ref = image.pixelColor(x, 0)
+            return all(cls._same_color(image.pixelColor(x, y), ref)
+                       for y in range(0, h, 4))
+
+        top = 0
+        while top < limit and row_uniform(top):
+            top += 1
+        bottom = 0
+        while bottom < limit and row_uniform(h - 1 - bottom):
+            bottom += 1
+        left = 0
+        while left < limit and col_uniform(left):
+            left += 1
+        right = 0
+        while right < limit and col_uniform(w - 1 - right):
+            right += 1
+
+        if not (top or bottom or left or right):
+            return image
+        return image.copy(left, top, w - left - right, h - top - bottom)
+
+    @staticmethod
+    def _build_pet_region(image: QImage) -> QRegion:
+        """由去底后的图像生成逻辑像素下的非透明区域（供点击穿透判定使用）。"""
+        logical = image.scaled(
+            PET_SIZE, PET_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        logical.setDevicePixelRatio(1.0)
+        return QRegion(QPixmap.fromImage(logical).mask())
 
     # ========================================================
     # 系统托盘
@@ -371,53 +520,44 @@ class DesktopPet(QWidget):
         self._schedule_next_state()
 
     def _set_state(self, state: PetState):
-        """设置宠物状态并重置相关动画参数。"""
+        """
+        切换宠物状态：重置帧计数与动画时间轴，并按状态调整刷新率。
+        表情差异全部在绘制层按 state 分支实现，这里不再维护一堆没人读的表情变量。
+        """
         self.state = state
         self._frame = 0
-        if state == PetState.IDLE:
-            self._mouth_open = 0
-            self._cheek_blush = 0
-            self._tear_drop = 0
-            self._head_tilt = 0
-            self._arm_offset = 0
-            self._stretch_y = 0
-        elif state == PetState.HAPPY:
-            self._mouth_open = 0.3
-            self._cheek_blush = 1
-            self._tear_drop = 0
-            self._head_tilt = 0
-            self._arm_offset = 0
-        elif state == PetState.SLEEPY:
-            self._mouth_open = 0.6
-            self._cheek_blush = 0
-            self._tear_drop = 0
-            self._head_tilt = 0
-            self._arm_offset = 0
-        elif state == PetState.POKE:
-            self._mouth_open = 0.8
-            self._cheek_blush = 0
-            self._tear_drop = 1
-            self._head_tilt = 0
-            self._arm_offset = 0
-            self._poke_timer.start(1500)
-        elif state == PetState.TYPING:
-            self._mouth_open = 0.1
-            self._cheek_blush = 0
-            self._tear_drop = 0
-            self._head_tilt = 0
-            self._arm_offset = 0
+        self._anim_time = 0.0
+        if state == PetState.POKE:
+            self._poke_timer.start(POKE_RECOVER_TIME)
+        self._apply_fps()
         self.update()
 
+    def _apply_fps(self):
+        """按当前状态选择帧率：活跃动画 30fps，发呆/困倦 12fps，减少无谓重绘。"""
+        self._fps = ANIMATION_FPS if self.state in (
+            PetState.HAPPY, PetState.POKE, PetState.TYPING
+        ) else IDLE_FPS
+        interval = max(1, int(1000 / self._fps))
+        if self._anim_timer.interval() != interval:
+            self._anim_timer.start(interval)
+
     def _recover_from_poke(self):
-        """从被戳状态恢复为发呆。"""
-        self._set_state(PetState.IDLE)
+        """
+        被戳结束：若用户手还在打字就接回 TYPING，否则回到发呆。
+        （原实现无条件回 IDLE，且 _typing 仍为 True，导致"边打字边被戳"后
+          宠物会一直发呆，必须停手 2 秒再打才恢复。）
+        """
+        if self._typing and int(time.time() * 1000) - self._last_key_time <= TYPING_TIMEOUT:
+            self._set_state(PetState.TYPING)
+        else:
+            self._set_state(PetState.IDLE)
 
     def _trigger_blink(self):
         """触发眨眼动画。"""
         if self.state in (PetState.SLEEPY, PetState.POKE):
             return
         self._blinking = True
-        QTimer.singleShot(200, self._end_blink)
+        QTimer.singleShot(BLINK_DURATION, self._end_blink)
         self.update()
 
     def _end_blink(self):
@@ -431,7 +571,8 @@ class DesktopPet(QWidget):
     def _update_animation(self):
         """更新动画帧，根据当前状态计算身体偏移、表情参数和气泡透明度。"""
         self._frame += 1
-        t = self._frame / ANIMATION_FPS
+        self._anim_time += 1.0 / self._fps   # 按实际帧间隔累加，换帧率后动画速度不变
+        t = self._anim_time
 
         if self.state == PetState.HAPPY:
             # 开心：正弦波弹跳
@@ -489,8 +630,14 @@ class DesktopPet(QWidget):
         新气泡出现时旧气泡立即关闭，带淡入效果，3 秒后自动淡出消失。
         """
         self._bubble_text = text
-        self._bubble_opacity = 0.0
-        self._bubble_fade_in = True
+        if self._bubble_opacity <= 0.0:
+            # 原本没有气泡：从透明淡入
+            self._bubble_opacity = 0.0
+            self._bubble_fade_in = True
+        else:
+            # 已有气泡在显示：直接换字保持不透明，避免"闪一下"
+            self._bubble_opacity = 1.0
+            self._bubble_fade_in = False
         self._bubble_fade_out = False
         self._bubble_timer.stop()
         self._bubble_timer.start(BUBBLE_SHOW_DURATION)
@@ -529,8 +676,8 @@ class DesktopPet(QWidget):
         若移动距离小于 5 像素，视为左键单击，触发被戳反应。
         """
         if event.button() == Qt.LeftButton:
-            moved = (event.globalPos() - self._drag_start_pos).manhattanLength()
-            if moved < 5:
+            delta = event.globalPos() - self._drag_start_pos
+            if math.hypot(delta.x(), delta.y()) < CLICK_THRESHOLD:
                 self._set_state(PetState.POKE)
                 self._show_bubble(BUBBLE_POKE_TEXT)
             self._dragging = False
@@ -539,8 +686,8 @@ class DesktopPet(QWidget):
     # ========================================================
     # 右键菜单
     # ========================================================
-    def _show_context_menu(self, pos):
-        """显示右键上下文菜单：隐藏宠物、重置位置、退出程序。"""
+    def _build_context_menu(self) -> QMenu:
+        """构建右键菜单（只构建一次，反复使用，避免长跑累积 QMenu 子对象）。"""
         menu = QMenu(self)
         act_hide = QAction("隐藏宠物", self)
         act_hide.triggered.connect(self.hide_pet)
@@ -555,37 +702,93 @@ class DesktopPet(QWidget):
         act_quit = QAction("退出程序", self)
         act_quit.triggered.connect(self.quit_app)
         menu.addAction(act_quit)
+        return menu
 
-        menu.exec_(pos)
+    def _show_context_menu(self, pos):
+        """显示右键上下文菜单：隐藏宠物、重置位置、退出程序。"""
+        self._context_menu.exec_(pos)
+
+    # ========================================================
+    # 点击穿透（透明像素不吞鼠标事件）
+    # ========================================================
+    def _opaque_region(self) -> QRegion:
+        """
+        当前帧真正"实体"的区域（窗口坐标）= 宠物非透明区域 + 可见气泡。
+        宠物区域按当前动画偏移平移，避免抖动时命中判定错位。
+        """
+        offset_x = self._shake_x + (WINDOW_SIZE - PET_SIZE) // 2
+        offset_y = self._bounce_y + (WINDOW_SIZE - PET_SIZE) // 2
+        region = self._pet_region.translated(offset_x, offset_y)
+        if self._bubble_text and self._bubble_opacity > 0.05:
+            bubble = self._bubble_rect().toRect().adjusted(-2, -2, 2, 2)
+            region = region.united(QRegion(bubble))
+        if region.isEmpty():
+            # 兜底：拿不到掩码时宁可让整个窗口可点，也不要变成点不到的幽灵
+            return QRegion(self.rect())
+        return region
+
+    def nativeEvent(self, event_type, message):
+        """
+        Windows：拦截 WM_NCHITTEST，把透明区域的命中结果改成 HTTRANSPARENT，
+        让鼠标事件落到宠物身后的窗口/桌面上，而不是被 220x220 的透明窗吞掉。
+        """
+        if PYWIN and event_type == b"windows_generic_MSG":
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_NCHITTEST:
+                    # lParam 低 16 位是屏幕 x，高 16 位是屏幕 y（均为有符号短整型）
+                    x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                    y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                    if not self._opaque_region().contains(self.mapFromGlobal(QPoint(x, y))):
+                        return True, HTTRANSPARENT
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
 
     # ========================================================
     # 功能动作
     # ========================================================
     def hide_pet(self):
-        """隐藏宠物窗口（托盘图标保留，可再次显示）。"""
-        self._hidden = True
+        """隐藏宠物窗口（托盘图标保留，可再次显示），同时停掉动画定时器省 CPU。"""
+        self._set_timers_active(False)
         self.hide()
 
     def show_pet(self):
-        """显示宠物窗口。"""
-        self._hidden = False
+        """显示宠物窗口并恢复定时器（窗口本身不接收焦点，故不调用 activateWindow）。"""
         self.show()
         self.raise_()
-        self.activateWindow()
+        self._set_timers_active(True)
+
+    def _set_timers_active(self, active: bool):
+        """统一开关与可见性相关的定时器：隐藏时不空转，避免白白烧 CPU。"""
+        if active:
+            self._anim_timer.start(max(1, int(1000 / self._fps)))
+            self._blink_timer.start(BLINK_INTERVAL)
+            self._typing_check_timer.start(500)
+            if not self._state_timer.isActive():
+                self._schedule_next_state()
+        else:
+            self._anim_timer.stop()
+            self._blink_timer.stop()
+            self._typing_check_timer.stop()
+
+    def _default_position(self, anchor=None) -> QPoint:
+        """默认停靠位置：锚点所在屏幕（默认主屏）可用区域的右下角。"""
+        geo = _screen_available_geometry(anchor)
+        return QPoint(geo.right() - WINDOW_SIZE - 10, geo.bottom() - WINDOW_SIZE - 10)
 
     def reset_position(self):
-        """重置宠物位置到屏幕右下角。"""
-        screen = QDesktopWidget().screenGeometry()
-        self.move(
-            screen.width() - WINDOW_SIZE - 10,
-            screen.height() - WINDOW_SIZE - 40
-        )
-        self._default_pos = self.pos()
+        """把宠物重置到当前所在屏幕的右下角（多屏下不会跳回主屏）。"""
+        self.move(self._default_position(self.pos()))
 
     def quit_app(self):
         """退出程序，清理托盘图标和键盘监听线程。"""
         if self._keyboard_listener is not None:
-            self._keyboard_listener.stop()
+            try:
+                self._keyboard_listener.stop()
+            except Exception:
+                pass
+            self._keyboard_listener = None
         if hasattr(self, '_tray'):
             self._tray.hide()
         QApplication.instance().quit()
@@ -636,12 +839,13 @@ class DesktopPet(QWidget):
     # 图片模式绘制
     # --------------------------------------------------------
     def _draw_image_mode(self, painter: QPainter):
-        """居中绘制宠物图片（已去除白底）。"""
-        pw = self._pixmap.width()
-        ph = self._pixmap.height()
-        x = (PET_SIZE - pw) // 2
-        y = (PET_SIZE - ph) // 2
-        painter.drawPixmap(x, y, self._pixmap)
+        """居中绘制宠物图片（已去除白底，按设备像素比换算成逻辑尺寸）。"""
+        dpr = self._pixmap.devicePixelRatio() or 1.0
+        pw = self._pixmap.width() / dpr
+        ph = self._pixmap.height() / dpr
+        painter.drawPixmap(
+            QPointF((PET_SIZE - pw) / 2.0, (PET_SIZE - ph) / 2.0), self._pixmap
+        )
 
     # --------------------------------------------------------
     # Fallback 模式绘制（图片加载失败时的默认绘制）
@@ -885,6 +1089,21 @@ class DesktopPet(QWidget):
     # --------------------------------------------------------
     # 气泡绘制
     # --------------------------------------------------------
+    def _bubble_rect(self) -> QRectF:
+        """
+        气泡外框（窗口坐标）：位于宠物头顶正上方，超出窗口顶部时贴边。
+        绘制与点击穿透判定共用这一份计算，保证"看起来在哪就能点到哪"。
+        """
+        font = QFont("Microsoft YaHei", 9, QFont.Bold)
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(self._bubble_text) + 16
+        th = fm.height() + 8
+        pet_cx = WINDOW_SIZE // 2 + self._shake_x
+        pet_top = (WINDOW_SIZE - PET_SIZE) // 2 + self._bounce_y
+        by = max(5, pet_top - th - 12)
+        bx = max(2, pet_cx - tw // 2)
+        return QRectF(bx, by, tw, th)
+
     def _draw_state_bubble_absolute(self, painter: QPainter):
         """
         在窗口绝对坐标系中绘制气泡。
@@ -897,29 +1116,18 @@ class DesktopPet(QWidget):
         painter.setPen(QPen(QColor(80, 80, 80), 1))
         painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
 
-        font = QFont("Microsoft YaHei", 9, QFont.Bold)
-        painter.setFont(font)
-        fm = QFontMetrics(font)
-        tw = fm.horizontalAdvance(self._bubble_text) + 16
-        th = fm.height() + 8
-
-        # 宠物头顶中心坐标
-        pet_cx = WINDOW_SIZE // 2 + self._shake_x
-        pet_top = (WINDOW_SIZE - PET_SIZE) // 2 + self._bounce_y
-        by = pet_top - th - 12
-        if by < 5:
-            by = 5
-        bx = pet_cx - tw // 2
+        painter.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
+        rect = self._bubble_rect()
+        pet_cx = rect.center().x()
 
         # 圆角矩形
-        rect = QRectF(bx, by, tw, th)
         painter.drawRoundedRect(rect, 8, 8)
 
         # 小三角指向宠物中心
         tri = QPainterPath()
-        tri.moveTo(pet_cx - 6, by + th)
-        tri.lineTo(pet_cx, by + th + 8)
-        tri.lineTo(pet_cx + 6, by + th)
+        tri.moveTo(pet_cx - 6, rect.bottom())
+        tri.lineTo(pet_cx, rect.bottom() + 8)
+        tri.lineTo(pet_cx + 6, rect.bottom())
         painter.drawPath(tri)
 
         # 文字
@@ -932,18 +1140,19 @@ class DesktopPet(QWidget):
 # 入口
 # ============================================================
 def main():
-    """程序入口：隐藏控制台黑框并启动应用。"""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-        except Exception:
-            pass
+    """程序入口：隐藏自身控制台、启用高 DPI 缩放并启动应用。"""
+    _hide_own_console()
+
+    # 高 DPI 相关属性必须在创建 QApplication 之前设置
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # 隐藏时保持运行
 
-    pet = DesktopPet()
+    pet = DesktopPet()   # noqa: F841  持有主窗口引用，避免被 GC 回收
     sys.exit(app.exec_())
 
 
